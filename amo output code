@@ -1,0 +1,963 @@
+
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <math.h>
+#include <stdlib.h>
+
+SoftwareSerial amoLink(8, 3);
+
+const byte CDS_PIN = A0;
+const byte NTC_PIN = A1;
+const byte JOY_X_PIN = A2;
+const byte JOY_Y_PIN = A3;
+const byte JOY_SW_PIN = 2;
+const byte FOOD_PIN = 4;
+const byte SELECT_PIN = 5;
+const byte TRIG_PIN = 12;
+const byte ECHO_PIN = 13;
+
+const byte START_AFFECTION = 100;
+const byte START_FULLNESS = 100;
+const byte PET_REWARD = 15;
+const byte JOY_REWARD = 15;
+const byte GYRO_REWARD = 15;
+const byte FOOD_REWARD = 25;
+const unsigned long AFF_DECAY_MS = 10000UL;
+const unsigned long FULL_DECAY_MS = 5000UL;
+const unsigned long REACTION_MS = 2000UL;
+const unsigned long TX_INTERVAL_MS = 150UL;
+const unsigned long DEBUG_INTERVAL_MS = 1000UL;
+const byte HUNGRY_AT = 25;
+
+const bool DARK_IS_LOW = true;
+const int DARK_ENTER_RAW = 350;
+const int DARK_EXIT_RAW = 450;
+const float HOT_ENTER_C = 30.0;
+const float HOT_EXIT_C = 28.0;
+const int JOY_DEADBAND = 170;
+const float PET_ENTER_CM = 7.0;
+const float PET_EXIT_CM = 9.0;
+const unsigned long PET_RELEASE_CONFIRM_MS = 300UL;
+const unsigned long FOOD_DEBOUNCE_MS = 35UL;
+const unsigned long JOY_RELEASE_CONFIRM_MS = 250UL;
+const unsigned long GYRO_QUIET_REARM_MS = 900UL;
+const float SERIES_RESISTOR = 10000.0;
+const float NOMINAL_RESISTANCE = 100000.0;
+const float NOMINAL_TEMPERATURE = 25.0;
+const float BETA = 3950.0;
+
+const unsigned long BUTTON_DELAY_MS = 250UL;
+const unsigned long ARROW_INTERVAL_MS = 1000UL;
+const unsigned long RESULT_INTERVAL_MS = 1800UL;
+const byte SEQUENCE_LENGTH = 5;
+const unsigned long TETRIS_FALL_MS = 650UL;
+const unsigned long TETRIS_REPEAT_MS = 180UL;
+
+enum AmoFace : byte {
+  HAPPY = 0, SHY = 1, SAD = 2, ANGRY = 3, SLEEPY = 4,
+  SURPRISED = 5, DIZZY = 6, FULL = 7, HEART = 8
+};
+
+enum ReactionSource : byte {
+  RX_NONE = 0, RX_FOOD, RX_GYRO, RX_PET, RX_JOY, RX_HOT, RX_DARK
+};
+
+enum RunMode : byte {
+  NORMAL_MODE,
+  MENU_MODE,
+  DIRECTION_SHOWING,
+  DIRECTION_INPUT,
+  DIRECTION_RESULT,
+  TETRIS_MODE,
+  TETRIS_OVER
+};
+
+byte affection = START_AFFECTION;
+byte fullness = START_FULLNESS;
+unsigned long lastAffDecay = 0;
+unsigned long lastFullDecay = 0;
+unsigned long lastTx = 0;
+unsigned long lastDebug = 0;
+
+bool darkActive = false;
+bool hotActive = false;
+bool foodLastRaw = false;
+bool foodStable = false;
+unsigned long foodRawChangedAt = 0;
+bool petLatched = false;
+unsigned long petAwaySince = 0;
+bool joyLatched = false;
+unsigned long joyNeutralSince = 0;
+bool gyroArmed = true;
+unsigned long lastGyroMoveAt = 0;
+bool mpuOK = false;
+bool haveAcceleration = false;
+int16_t prevAx = 0, prevAy = 0, prevAz = 0;
+byte activeReaction = RX_NONE;
+byte reactionFace = HAPPY;
+unsigned long reactionStartedAt = 0;
+
+RunMode runMode = NORMAL_MODE;
+byte menuSelection = 0;
+bool previousSelect = HIGH;
+unsigned long lastSelectAt = 0;
+bool previousJoyButton = HIGH;
+unsigned long lastJoyButtonAt = 0;
+bool gameJoyArmed = true;
+unsigned long gameTimer = 0;
+unsigned long pausedAt = 0;
+
+byte gameSequence[SEQUENCE_LENGTH];
+byte previousSequence[SEQUENCE_LENGTH];
+byte showIndex = 0;
+byte inputIndex = 0;
+bool havePreviousSequence = false;
+bool lastResultCorrect = false;
+byte directionRound = 0;
+byte maxDirectionRound = 0;
+unsigned long tetrisStartedAt = 0;
+unsigned long lastTetrisTimeSent = 0;
+
+byte board[8];
+byte pieceShape = 0;
+byte pieceRotation = 0;
+int pieceX = 2;
+int pieceY = 0;
+unsigned long lastFallAt = 0;
+unsigned long lastMoveAt = 0;
+bool foodButtonLast = HIGH;
+unsigned long foodButtonChangedAt = 0;
+
+byte addClamped(byte value, byte amount) {
+  int total = (int)value + (int)amount;
+  return (byte)(total > 100 ? 100 : total);
+}
+
+float readTempC() {
+  int raw = analogRead(NTC_PIN);
+  if (raw <= 0 || raw >= 1023) return NAN;
+  float resistance = SERIES_RESISTOR * (1023.0 / raw - 1.0);
+  float t = log(resistance / NOMINAL_RESISTANCE) / BETA;
+  t += 1.0 / (NOMINAL_TEMPERATURE + 273.15);
+  return 1.0 / t - 273.15;
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 20000UL);
+  if (duration == 0) return -1.0;
+  return duration * 0.0343 / 2.0;
+}
+
+int16_t readI16() {
+  uint16_t hi = (uint8_t)Wire.read();
+  uint16_t lo = (uint8_t)Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+bool detectMotionNow() {
+  if (!mpuOK) return false;
+  Wire.beginTransmission(0x68);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)0x68, (uint8_t)14) != 14) return false;
+  int16_t ax = readI16(), ay = readI16(), az = readI16();
+  (void)readI16();
+  int16_t gx = readI16(), gy = readI16(), gz = readI16();
+  bool moving = false;
+  if (haveAcceleration) {
+    long delta = labs((long)ax - prevAx) + labs((long)ay - prevAy)
+               + labs((long)az - prevAz);
+    moving = delta > 14000L || labs((long)gx) > 10000L
+           || labs((long)gy) > 10000L || labs((long)gz) > 10000L;
+  }
+  prevAx = ax;
+  prevAy = ay;
+  prevAz = az;
+  haveAcceleration = true;
+  return moving;
+}
+
+void sendState(byte face) {
+  amoLink.print(F("S,"));
+  amoLink.print((int)face);
+  amoLink.print(',');
+  amoLink.print((int)affection);
+  amoLink.print(',');
+  amoLink.print((int)fullness);
+  amoLink.print(',');
+  amoLink.println((int)hotActive);
+}
+
+void sendGame(char command) {
+  amoLink.print(F("G,"));
+  amoLink.println(command);
+}
+
+void sendMode(byte mode, byte selection = 0) {
+  amoLink.print(F("M,"));
+  amoLink.print((int)mode);
+  if (mode == 1) {
+    amoLink.print(',');
+    amoLink.print((int)selection);
+  }
+  amoLink.println();
+}
+
+void sendTetrisBoard() {
+  byte displayRows[8] = {0,0,0,0,0,0,0,0};
+  for (byte y = 0; y < 8; y++) {
+    for (byte x = 0; x < 8; x++) {
+      if (board[y] & (1 << x)) displayRows[y] |= (0x80 >> x);
+    }
+  }
+
+  byte shape[4];
+  const byte shapes[7][4] = {
+    {0,0,15,0}, {0,6,6,0}, {0,7,2,0}, {0,6,3,0},
+    {0,3,6,0}, {0,1,7,0}, {0,4,7,0}
+  };
+  for (byte r = 0; r < 4; r++) shape[r] = shapes[pieceShape][r];
+
+  for (byte r = 0; r < pieceRotation; r++) {
+    byte rotated[4] = {0,0,0,0};
+    for (byte y = 0; y < 4; y++) {
+      for (byte x = 0; x < 4; x++) {
+        if (shape[y] & (1 << x)) rotated[x] |= (1 << (3 - y));
+      }
+    }
+    for (byte y = 0; y < 4; y++) shape[y] = rotated[y];
+  }
+
+  if (runMode == TETRIS_MODE) {
+    for (byte y = 0; y < 4; y++) {
+      for (byte x = 0; x < 4; x++) {
+        if (shape[y] & (1 << x)) {
+          int bx = pieceX + x;
+          int by = pieceY + y;
+          if (bx >= 0 && bx < 8 && by >= 0 && by < 8) {
+            displayRows[by] |= (0x80 >> bx);
+          }
+        }
+      }
+    }
+  }
+
+  amoLink.print(F("T,"));
+  for (byte y = 0; y < 8; y++) {
+    if (displayRows[y] < 16) amoLink.print('0');
+    amoLink.print(displayRows[y], HEX);
+  }
+  amoLink.println();
+}
+
+byte chooseFace() {
+  if (activeReaction != RX_NONE) return reactionFace;
+  if (hotActive) return ANGRY;
+  if (darkActive) return SLEEPY;
+  if (affection == 0 || fullness == 0) return ANGRY;
+  if (fullness <= HUNGRY_AT) return SAD;
+  if (affection == 100) return HEART;
+  if (affection < 50) return SAD;
+  return HAPPY;
+}
+
+void updateVitals(unsigned long now) {
+  while (now - lastAffDecay >= AFF_DECAY_MS) {
+    lastAffDecay += AFF_DECAY_MS;
+    affection = (affection >= 10) ? affection - 10 : 0;
+  }
+  while (now - lastFullDecay >= FULL_DECAY_MS) {
+    lastFullDecay += FULL_DECAY_MS;
+    fullness = (fullness >= 5) ? fullness - 5 : 0;
+  }
+}
+
+bool updateFoodButton(unsigned long now) {
+  bool raw = (digitalRead(FOOD_PIN) == LOW);
+  if (raw != foodLastRaw) {
+    foodLastRaw = raw;
+    foodRawChangedAt = now;
+  }
+  if (now - foodRawChangedAt >= FOOD_DEBOUNCE_MS && raw != foodStable) {
+    foodStable = raw;
+    return foodStable;
+  }
+  return false;
+}
+
+bool updatePet(float distance, unsigned long now) {
+  bool near = distance >= 2.0 && distance <= PET_ENTER_CM;
+  bool away = distance < 0 || distance > PET_EXIT_CM;
+  if (!petLatched && near) {
+    petLatched = true;
+    petAwaySince = 0;
+    return true;
+  }
+  if (petLatched) {
+    if (away) {
+      if (petAwaySince == 0) petAwaySince = now;
+      if (now - petAwaySince >= PET_RELEASE_CONFIRM_MS) {
+        petLatched = false;
+        petAwaySince = 0;
+      }
+    } else {
+      petAwaySince = 0;
+    }
+  }
+  return false;
+}
+
+bool updateJoystick(bool active, unsigned long now) {
+  if (active) {
+    joyNeutralSince = 0;
+    if (!joyLatched) {
+      joyLatched = true;
+      return true;
+    }
+  } else if (joyLatched) {
+    if (joyNeutralSince == 0) joyNeutralSince = now;
+    if (now - joyNeutralSince >= JOY_RELEASE_CONFIRM_MS) {
+      joyLatched = false;
+      joyNeutralSince = 0;
+    }
+  }
+  return false;
+}
+
+bool updateGyro(bool moving, unsigned long now) {
+  if (moving) {
+    lastGyroMoveAt = now;
+    if (gyroArmed) {
+      gyroArmed = false;
+      return true;
+    }
+  } else if (!gyroArmed && now - lastGyroMoveAt >= GYRO_QUIET_REARM_MS) {
+    gyroArmed = true;
+  }
+  return false;
+}
+
+bool reactionIsHeld(byte src, bool joyActive, bool gyroMoving, unsigned long now) {
+  switch (src) {
+    case RX_FOOD: return foodStable;
+    case RX_PET: return petLatched;
+    case RX_JOY: return joyActive;
+    case RX_GYRO: return gyroMoving || now - lastGyroMoveAt < GYRO_QUIET_REARM_MS;
+    default: return false;
+  }
+}
+
+void startReaction(byte src, unsigned long now) {
+  activeReaction = src;
+  reactionStartedAt = now;
+  switch (src) {
+    case RX_FOOD:
+      reactionFace = FULL;
+      fullness = addClamped(fullness, FOOD_REWARD);
+      break;
+    case RX_GYRO:
+      reactionFace = SURPRISED;
+      affection = addClamped(affection, GYRO_REWARD);
+      break;
+    case RX_PET:
+      reactionFace = SHY;
+      affection = addClamped(affection, PET_REWARD);
+      break;
+    case RX_JOY:
+      reactionFace = DIZZY;
+      affection = addClamped(affection, JOY_REWARD);
+      break;
+    case RX_HOT: reactionFace = ANGRY; break;
+    case RX_DARK: reactionFace = SLEEPY; break;
+  }
+}
+
+int readJoystickDirection() {
+  int x = analogRead(JOY_X_PIN);
+  int y = analogRead(JOY_Y_PIN);
+  if (y > 512 + JOY_DEADBAND) return 0;
+  if (y < 512 - JOY_DEADBAND) return 1;
+  if (x < 512 - JOY_DEADBAND) return 2;
+  if (x > 512 + JOY_DEADBAND) return 3;
+  return -1;
+}
+
+void generateSequence() {
+  bool sameAsPrevious;
+  do {
+    for (byte i = 0; i < SEQUENCE_LENGTH; i++) {
+      byte direction;
+      do {
+        direction = random(0, 4);
+      } while (i > 0 && direction == gameSequence[i - 1]);
+      gameSequence[i] = direction;
+    }
+
+    sameAsPrevious = havePreviousSequence;
+
+    if (havePreviousSequence) {
+      for (byte i = 0; i < SEQUENCE_LENGTH; i++) {
+        if (gameSequence[i] != previousSequence[i]) {
+          sameAsPrevious = false;
+          break;
+        }
+      }
+    }
+  } while (sameAsPrevious);
+
+  for (byte i = 0; i < SEQUENCE_LENGTH; i++) {
+    previousSequence[i] = gameSequence[i];
+  }
+
+  havePreviousSequence = true;
+}
+
+void showArrow(byte direction) {
+  if (direction == 0) sendGame('U');
+  else if (direction == 1) sendGame('D');
+  else if (direction == 2) sendGame('L');
+  else sendGame('R');
+}
+
+void sendDirectionStatus() {
+  amoLink.print(F("R,"));
+  amoLink.print((int)directionRound);
+  amoLink.print(',');
+  amoLink.println((int)maxDirectionRound);
+}
+
+void startDirectionRound() {
+  directionRound++;
+  sendDirectionStatus();
+  generateSequence();
+
+  showIndex = 0;
+  inputIndex = 0;
+
+  showArrow(gameSequence[showIndex]);
+  showIndex++;
+
+  runMode = DIRECTION_SHOWING;
+  gameTimer = millis() + ARROW_INTERVAL_MS;
+}
+
+void startDirectionGame() {
+  directionRound = 0;
+  maxDirectionRound = 0;
+  havePreviousSequence = false;
+
+  gameJoyArmed = readJoystickDirection() == -1;
+
+  sendMode(0);
+  sendGame('I');
+
+  startDirectionRound();
+}
+
+void finishDirectionGame(bool correct) {
+  lastResultCorrect = correct;
+
+  if (correct && directionRound > maxDirectionRound) {
+    maxDirectionRound = directionRound;
+  }
+
+  if (!correct) {
+    directionRound = 1;
+  }
+
+  sendGame(correct ? 'W' : 'X');
+  sendDirectionStatus();
+
+  runMode = DIRECTION_RESULT;
+  gameTimer = millis() + RESULT_INTERVAL_MS;
+}
+
+void handleDirectionGame() {
+  unsigned long now = millis();
+
+  if (runMode == DIRECTION_SHOWING) {
+    if ((long)(now - gameTimer) >= 0) {
+      if (showIndex < SEQUENCE_LENGTH) {
+        showArrow(gameSequence[showIndex++]);
+        gameTimer = now + ARROW_INTERVAL_MS;
+      } else {
+        sendGame('P');
+        runMode = DIRECTION_INPUT;
+        inputIndex = 0;
+        gameJoyArmed = readJoystickDirection() == -1;
+      }
+    }
+  }
+  else if (runMode == DIRECTION_INPUT) {
+    int direction = readJoystickDirection();
+
+    if (direction == -1) {
+      gameJoyArmed = true;
+    }
+    else if (gameJoyArmed) {
+      gameJoyArmed = false;
+
+      if (direction == gameSequence[inputIndex]) {
+        inputIndex++;
+
+        if (inputIndex >= SEQUENCE_LENGTH) {
+          finishDirectionGame(true);
+        }
+      }
+      else {
+        finishDirectionGame(false);
+      }
+    }
+  }
+  else if (runMode == DIRECTION_RESULT && (long)(now - gameTimer) >= 0) {
+    if (lastResultCorrect) {
+      startDirectionRound();
+    }
+    else {
+      generateSequence();
+
+      showIndex = 0;
+      inputIndex = 0;
+
+      showArrow(gameSequence[showIndex]);
+      showIndex++;
+
+      runMode = DIRECTION_SHOWING;
+      gameTimer = now + ARROW_INTERVAL_MS;
+    }
+  }
+}
+
+const byte tetrisShapes[7][4] = {
+  {0,0,15,0}, {0,6,6,0}, {0,7,2,0}, {0,6,3,0},
+  {0,3,6,0}, {0,1,7,0}, {0,4,7,0}
+};
+
+void getPiece(byte shapeId, byte rotation, byte result[4]) {
+  for (byte i = 0; i < 4; i++) result[i] = tetrisShapes[shapeId][i];
+
+  for (byte r = 0; r < rotation; r++) {
+    byte rotated[4] = {0,0,0,0};
+
+    for (byte y = 0; y < 4; y++) {
+      for (byte x = 0; x < 4; x++) {
+        if (result[y] & (1 << x)) {
+          rotated[x] |= (1 << (3 - y));
+        }
+      }
+    }
+
+    for (byte y = 0; y < 4; y++) result[y] = rotated[y];
+  }
+}
+
+bool pieceFits(int testX, int testY, byte rotation) {
+  byte shape[4];
+  getPiece(pieceShape, rotation, shape);
+
+  for (byte y = 0; y < 4; y++) {
+    for (byte x = 0; x < 4; x++) {
+      if (shape[y] & (1 << x)) {
+        int bx = testX + x;
+        int by = testY + y;
+
+        if (bx < 0 || bx >= 8 || by >= 8) return false;
+        if (by >= 0 && (board[by] & (1 << bx))) return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+void spawnPiece() {
+  pieceShape = random(0, 7);
+  pieceRotation = 0;
+  pieceX = 2;
+  pieceY = 0;
+
+  if (!pieceFits(pieceX, pieceY, pieceRotation)) {
+    runMode = TETRIS_OVER;
+    sendGame('O');
+  }
+
+  lastFallAt = millis();
+  lastMoveAt = 0;
+}
+
+void clearFullRows() {
+  for (int y = 7; y >= 0; y--) {
+    if (board[y] == 0xFF) {
+      for (int moveY = y; moveY > 0; moveY--) {
+        board[moveY] = board[moveY - 1];
+      }
+
+      board[0] = 0;
+      y++;
+    }
+  }
+}
+
+void lockPiece() {
+  byte shape[4];
+  getPiece(pieceShape, pieceRotation, shape);
+
+  bool touchedCeiling = false;
+
+  for (byte y = 0; y < 4; y++) {
+    for (byte x = 0; x < 4; x++) {
+      if (shape[y] & (1 << x)) {
+        int bx = pieceX + x;
+        int by = pieceY + y;
+
+        if (by == 0) touchedCeiling = true;
+
+        if (bx >= 0 && bx < 8 && by >= 0 && by < 8) {
+          board[by] |= (1 << bx);
+        }
+      }
+    }
+  }
+
+  if (touchedCeiling) {
+    runMode = TETRIS_OVER;
+    sendGame('O');
+    return;
+  }
+
+  clearFullRows();
+  spawnPiece();
+}
+
+void startTetris() {
+  for (byte i = 0; i < 8; i++) board[i] = 0;
+
+  tetrisStartedAt = millis();
+  lastTetrisTimeSent = 0;
+
+  amoLink.println(F("E,0"));
+  sendMode(2);
+
+  spawnPiece();
+
+  runMode = TETRIS_MODE;
+  lastFallAt = millis();
+
+  sendTetrisBoard();
+}
+
+void handleTetris() {
+  unsigned long now = millis();
+  unsigned long elapsedSeconds = (now - tetrisStartedAt) / 1000UL;
+
+  if (elapsedSeconds != lastTetrisTimeSent) {
+    lastTetrisTimeSent = elapsedSeconds;
+    amoLink.print(F("E,"));
+    amoLink.println(elapsedSeconds);
+  }
+
+  int direction = readJoystickDirection();
+
+  if (direction == -1) {
+    gameJoyArmed = true;
+  }
+  else if (gameJoyArmed && (direction == 2 || direction == 3)) {
+    gameJoyArmed = false;
+
+    if (pieceFits(pieceX + (direction == 2 ? -1 : 1), pieceY, pieceRotation)) {
+      pieceX += (direction == 2 ? -1 : 1);
+      sendTetrisBoard();
+    }
+  }
+
+  bool foodNow = digitalRead(FOOD_PIN);
+
+  if (foodNow != foodButtonLast) {
+    foodButtonLast = foodNow;
+    foodButtonChangedAt = now;
+  }
+
+  static bool foodHandled = false;
+
+  if (now - foodButtonChangedAt >= FOOD_DEBOUNCE_MS) {
+    if (foodNow == LOW && !foodHandled) {
+      foodHandled = true;
+
+      byte nextRotation = (pieceRotation + 1) % 4;
+
+      if (pieceFits(pieceX, pieceY, nextRotation)) {
+        pieceRotation = nextRotation;
+        sendTetrisBoard();
+      }
+    }
+    else if (foodNow == HIGH) {
+      foodHandled = false;
+    }
+  }
+
+  if (now - lastFallAt >= TETRIS_FALL_MS) {
+    lastFallAt = now;
+
+    if (pieceFits(pieceX, pieceY + 1, pieceRotation)) {
+      pieceY++;
+    }
+    else {
+      lockPiece();
+    }
+
+    sendTetrisBoard();
+  }
+}
+
+void enterMenu() {
+  runMode = MENU_MODE;
+  menuSelection = 0;
+  pausedAt = millis();
+  sendMode(1, menuSelection);
+}
+
+void resumeNormal() {
+  unsigned long pausedDuration = millis() - pausedAt;
+
+  lastAffDecay += pausedDuration;
+  lastFullDecay += pausedDuration;
+
+  if (activeReaction != RX_NONE) {
+    reactionStartedAt += pausedDuration;
+  }
+
+  runMode = NORMAL_MODE;
+  activeReaction = RX_NONE;
+
+  foodLastRaw = digitalRead(FOOD_PIN) == LOW;
+  foodStable = foodLastRaw;
+  foodRawChangedAt = millis();
+
+  petLatched = false;
+  petAwaySince = 0;
+  joyLatched = false;
+  joyNeutralSince = 0;
+
+  gyroArmed = false;
+  lastGyroMoveAt = millis();
+
+  previousJoyButton = digitalRead(JOY_SW_PIN);
+
+  sendMode(0);
+  sendState(chooseFace());
+}
+
+void selectMenuItem() {
+  if (menuSelection == 0) {
+    sendMode(0);
+    startDirectionGame();
+  } else {
+    startTetris();
+  }
+}
+
+void handleMenu() {
+  int direction = readJoystickDirection();
+
+  if (direction == -1) {
+    gameJoyArmed = true;
+  }
+  else if (gameJoyArmed && (direction == 2 || direction == 3)) {
+    gameJoyArmed = false;
+    menuSelection = (menuSelection == 0) ? 1 : 0;
+    sendMode(1, menuSelection);
+  }
+
+  bool buttonNow = digitalRead(JOY_SW_PIN);
+
+  if (buttonNow == LOW && previousJoyButton == HIGH
+      && millis() - lastJoyButtonAt >= BUTTON_DELAY_MS) {
+    lastJoyButtonAt = millis();
+    selectMenuItem();
+  }
+
+  previousJoyButton = buttonNow;
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(8, INPUT_PULLUP);
+  amoLink.begin(9600);
+
+  pinMode(JOY_SW_PIN, INPUT_PULLUP);
+  pinMode(FOOD_PIN, INPUT_PULLUP);
+  pinMode(SELECT_PIN, INPUT_PULLUP);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  Wire.begin();
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  mpuOK = Wire.endTransmission() == 0;
+
+  lastAffDecay = millis();
+  lastFullDecay = lastAffDecay;
+
+  randomSeed(analogRead(A0) + analogRead(A1) + micros());
+
+  previousSelect = digitalRead(SELECT_PIN);
+  previousJoyButton = digitalRead(JOY_SW_PIN);
+
+  Serial.println(F("AMO INPUT READY"));
+
+  if (!mpuOK) Serial.println(F("MPU6050 NOT FOUND"));
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  bool selectNow = digitalRead(SELECT_PIN);
+  bool selectPressed = previousSelect == HIGH && selectNow == LOW
+                    && now - lastSelectAt >= BUTTON_DELAY_MS;
+
+  previousSelect = selectNow;
+
+  if (selectPressed) {
+    lastSelectAt = now;
+
+    if (runMode == NORMAL_MODE) {
+      enterMenu();
+    }
+    else {
+      resumeNormal();
+    }
+  }
+
+  if (runMode == MENU_MODE) {
+    handleMenu();
+    delay(20);
+    return;
+  }
+
+  if (runMode == DIRECTION_SHOWING || runMode == DIRECTION_INPUT
+      || runMode == DIRECTION_RESULT) {
+    handleDirectionGame();
+    delay(20);
+    return;
+  }
+
+  if (runMode == TETRIS_MODE) {
+    handleTetris();
+    delay(20);
+    return;
+  }
+
+  if (runMode == TETRIS_OVER) {
+    sendTetrisBoard();
+    delay(50);
+    return;
+  }
+
+  updateVitals(now);
+
+  int light = analogRead(CDS_PIN);
+  int darkScaled = DARK_IS_LOW ? light : 1023 - light;
+
+  bool prevDark = darkActive;
+
+  if (!darkActive && darkScaled <= DARK_ENTER_RAW) {
+    darkActive = true;
+  }
+  else if (darkActive && darkScaled >= DARK_EXIT_RAW) {
+    darkActive = false;
+  }
+
+  bool darkRise = !prevDark && darkActive;
+
+  float temp = readTempC();
+  bool prevHot = hotActive;
+
+  if (isnan(temp)) {
+    hotActive = false;
+  }
+  else if (!hotActive && temp >= HOT_ENTER_C) {
+    hotActive = true;
+  }
+  else if (hotActive && temp <= HOT_EXIT_C) {
+    hotActive = false;
+  }
+
+  bool hotRise = !prevHot && hotActive;
+
+  bool foodRise = updateFoodButton(now);
+  float distance = readDistanceCm();
+  bool petRise = updatePet(distance, now);
+
+  int joyX = analogRead(JOY_X_PIN);
+  int joyY = analogRead(JOY_Y_PIN);
+
+  bool joyActive = abs(joyX - 512) > JOY_DEADBAND
+                || abs(joyY - 512) > JOY_DEADBAND
+                || digitalRead(JOY_SW_PIN) == LOW;
+
+  bool joyRise = updateJoystick(joyActive, now);
+
+  bool gyroMoving = detectMotionNow();
+  bool gyroRise = updateGyro(gyroMoving, now);
+
+  if (activeReaction != RX_NONE) {
+    bool lockedByTime = now - reactionStartedAt < REACTION_MS;
+    bool held = reactionIsHeld(activeReaction, joyActive, gyroMoving, now);
+
+    if (!lockedByTime && !held) {
+      activeReaction = RX_NONE;
+    }
+  }
+
+  if (activeReaction == RX_NONE) {
+    if (foodRise) startReaction(RX_FOOD, now);
+    else if (gyroRise) startReaction(RX_GYRO, now);
+    else if (petRise) startReaction(RX_PET, now);
+    else if (joyRise) startReaction(RX_JOY, now);
+    else if (hotRise) startReaction(RX_HOT, now);
+    else if (darkRise) startReaction(RX_DARK, now);
+  }
+
+  byte wanted = chooseFace();
+
+  if (now - lastTx >= TX_INTERVAL_MS) {
+    lastTx = now;
+    sendState(wanted);
+  }
+
+  if (now - lastDebug >= DEBUG_INTERVAL_MS) {
+    lastDebug = now;
+
+    Serial.print(F("LUV="));
+    Serial.print(affection);
+    Serial.print(F(" FULL="));
+    Serial.print(fullness);
+    Serial.print(F(" LDR="));
+    Serial.print(light);
+    Serial.print(F(" TEMP="));
+
+    if (isnan(temp)) Serial.print(F("ERR"));
+    else Serial.print(temp, 1);
+
+    Serial.print(F(" DIST="));
+    Serial.print(distance, 1);
+    Serial.print(F(" JOY="));
+    Serial.print(joyX);
+    Serial.print(',');
+    Serial.print(joyY);
+    Serial.print(F(" FACE="));
+    Serial.println((int)wanted);
+  }
+
+  delay(30);
+}
